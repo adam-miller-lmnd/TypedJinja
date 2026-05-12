@@ -36,6 +36,151 @@ function logToClient(msg: string) {
 const TEMPLATES_ROOT = process.env.TYPEDJINJA_TEMPLATES_ROOT || '';
 logToClient(`[TypedJinja LSP] Templates root directory: ${TEMPLATES_ROOT}`);
 
+function escapeRegex(s: string): string {
+  return s.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+}
+
+/** Walk parents to find a dbt project root (directory containing dbt_project.yml). */
+function findDbtProjectRoot(fromFile: string): string | null {
+  const pathModule = require('path');
+  let dir = pathModule.dirname(fromFile);
+  for (let i = 0; i < 48; i++) {
+    if (fs.existsSync(pathModule.join(dir, 'dbt_project.yml'))) {
+      return dir;
+    }
+    const parent = pathModule.dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return null;
+}
+
+function offsetToLineCharacter(content: string, offset: number): { line: number; character: number } {
+  const before = content.slice(0, offset);
+  const lines = before.split(/\r?\n/);
+  const line = lines.length - 1;
+  const character = lines[lines.length - 1].length;
+  return { line, character };
+}
+
+/** Locate modelName.sql anywhere under the dbt models directory (depth-first). */
+function findModelSqlFile(dbtRoot: string, modelName: string): string | null {
+  const pathModule = require('path');
+  const modelsDir = pathModule.join(dbtRoot, 'models');
+  if (!fs.existsSync(modelsDir)) {
+    return null;
+  }
+  const target = `${modelName}.sql`;
+  const found: string[] = [];
+  function walk(d: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (ent.name.startsWith('.')) {
+        continue;
+      }
+      const full = pathModule.join(d, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+      } else if (ent.name === target) {
+        found.push(full);
+      }
+    }
+  }
+  walk(modelsDir);
+  return found.length > 0 ? found[0] : null;
+}
+
+/** Resolve standard dbt macro definitions (Jinja percent-macro syntax). */
+function findJinjaMacroDefinitionRange(filePath: string, macroName: string): Range | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+  const re = new RegExp('\\{\\%\\s*-?\\s*macro\\s+' + escapeRegex(macroName) + '(?=\\s*\\()', 'm');
+  const m = re.exec(content);
+  if (!m) {
+    return null;
+  }
+  const nameStart = m.index + m[0].length - macroName.length;
+  const nameEnd = nameStart + macroName.length;
+  const start = offsetToLineCharacter(content, nameStart);
+  const end = offsetToLineCharacter(content, nameEnd);
+  return Range.create(start.line, start.character, end.line, end.character);
+}
+
+function findMacroInDbtMacrosDir(dbtRoot: string, macroName: string): { filePath: string; range: Range } | null {
+  const pathModule = require('path');
+  const macrosDir = pathModule.join(dbtRoot, 'macros');
+  if (!fs.existsSync(macrosDir)) {
+    return null;
+  }
+  let result: { filePath: string; range: Range } | null = null;
+  function walk(d: string): void {
+    if (result) {
+      return;
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (result) {
+        return;
+      }
+      if (ent.name.startsWith('.')) {
+        continue;
+      }
+      const full = pathModule.join(d, ent.name);
+      if (ent.isDirectory()) {
+        walk(full);
+      } else if (/\.(sql|jinja)$/i.test(ent.name)) {
+        const range = findJinjaMacroDefinitionRange(full, macroName);
+        if (range) {
+          result = { filePath: full, range };
+        }
+      }
+    }
+  }
+  walk(macrosDir);
+  return result;
+}
+
+function tryDbtRefDefinition(
+  doc: TextDocument,
+  position: { line: number; character: number },
+  dbtRoot: string
+): Definition | null {
+  const offset = doc.offsetAt(position);
+  const text = doc.getText();
+  const re = /\bref\s*\(\s*(['"])([^'"]+)\1/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (offset >= m.index && offset <= re.lastIndex) {
+      const modelPath = findModelSqlFile(dbtRoot, m[2]);
+      if (modelPath) {
+        logToClient(
+          '[Definition dbt ref] Resolved ref(' + JSON.stringify(m[2]) + ') -> ' + modelPath
+        );
+        return [{ uri: url.pathToFileURL(modelPath).toString(), range: Range.create(0, 0, 0, 0) }];
+      }
+      logToClient(`[Definition dbt ref] No models/**/${m[2]}${'.sql'} under ${dbtRoot}`);
+      return null;
+    }
+  }
+  return null;
+}
+
 // Create a simple text document manager
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 
@@ -227,37 +372,6 @@ connection.onCompletion(
   }
 );
 
-// Utility: Lookup a macro definition by name via Python LSP CLI
-function findMacroDefinitionByName(doc: TextDocument, macroName: string): { node: any } | null {
-  const templatePath = url.fileURLToPath(doc.uri);
-  const pythonExec = process.env.PYTHON_PATH || 'python3';
-  const result = spawnSync(
-    pythonExec,
-    ['-m', 'typedjinja.lsp_server', 'find_macro_definition', templatePath, macroName],
-    { encoding: 'utf8' }
-  );
-  if (result.error || result.stderr) {
-    logToClient(`[MacroDef ERROR] ${result.error ?? result.stderr}`);
-    return null;
-  }
-  let def;
-  try {
-    def = JSON.parse(result.stdout);
-  } catch (e) {
-    logToClient(`[MacroDef Parse ERROR] ${result.stdout}`);
-    return null;
-  }
-  if (!def.file_path) {
-    return null;
-  }
-  const node = {
-    startPosition: { row: def.line, column: def.col },
-    endPosition: { row: def.line, column: def.col },
-    filePath: def.file_path,
-  };
-  return { node };
-}
-
 // Helper: Determine context for definitions by regex matching include or macro calls
 function getDefinitionContext(
   doc: TextDocument,
@@ -319,10 +433,22 @@ connection.onDefinition(
     const doc = documents.get(params.textDocument.uri);
     if (!doc) return null;
 
+    const templatePath = url.fileURLToPath(doc.uri);
+    const dbtRoot =
+      templatePath.endsWith('.sql') ? findDbtProjectRoot(templatePath) : null;
+    const pathRoot = dbtRoot || TEMPLATES_ROOT;
+
     logToClient(`[Definition] Request for ${params.textDocument.uri} at L${params.position.line}C${params.position.character}`);
     const wordAtCursor = getWordAt(doc, params.position);
     logToClient(`[Definition Debug WordAtCursor] '${wordAtCursor}'`);
     const fullDocText = doc.getText();
+
+    if (dbtRoot) {
+      const refDef = tryDbtRefDefinition(doc, params.position, dbtRoot);
+      if (refDef) {
+        return refDef;
+      }
+    }
 
     // Path 1: Handle @types block definitions
     const docLines = fullDocText.split(/\r?\n/);
@@ -344,7 +470,6 @@ connection.onDefinition(
       }
       if (currentWordInTypesBlock) {
         logToClient(`[Definition @types] Word: '${currentWordInTypesBlock}'`);
-        const templatePath = url.fileURLToPath(doc.uri);
         const stubPath = (() => {
           const p = require('path');
           const dir = p.dirname(templatePath);
@@ -373,9 +498,9 @@ connection.onDefinition(
     if (context) {
       if (context.type === 'include') {
         const rel = context.target;
-        if (!TEMPLATES_ROOT) { logToClient('[Definition Include] TEMPLATES_ROOT not set.'); return null; }
+        if (!pathRoot) { logToClient('[Definition Include] No project root (dbt or TEMPLATES_ROOT) set.'); return null; }
         const pathModule = require('path');
-        const absPath = pathModule.resolve(TEMPLATES_ROOT, rel);
+        const absPath = pathModule.resolve(pathRoot, rel);
         try {
           fs.accessSync(absPath);
           logToClient(`[Definition Include] Found: ${absPath}`);
@@ -387,24 +512,23 @@ connection.onDefinition(
         const macroName = context.name;
         const sourceTemplate = context.sourceTemplate;
         logToClient(`[Definition MacroCall] Name: '${macroName}', Source: '${sourceTemplate || 'current file'}'`);
-        let targetDoc = doc; let targetUri = doc.uri;
+        let targetUri = doc.uri;
         if (sourceTemplate) {
-          if (!TEMPLATES_ROOT) { logToClient('[Definition MacroCallImport] TEMPLATES_ROOT not set.'); return null; }
+          if (!pathRoot) { logToClient('[Definition MacroCallImport] No project root set.'); return null; }
           const pathModule = require('path');
-          const targetTemplateFsPath = pathModule.resolve(TEMPLATES_ROOT, sourceTemplate);
+          const targetTemplateFsPath = pathModule.resolve(pathRoot, sourceTemplate);
           try {
-            const fileText = fs.readFileSync(targetTemplateFsPath, 'utf8');
-            targetDoc = TextDocument.create(url.pathToFileURL(targetTemplateFsPath).toString(), 'jinja', 1, fileText);
-            targetUri = targetDoc.uri;
+            fs.accessSync(targetTemplateFsPath);
+            targetUri = url.pathToFileURL(targetTemplateFsPath).toString();
           } catch (e) { logToClient(`[Definition MacroCallImport ERROR] ${e}`); return null; }
         }
-        const macroDef = findMacroDefinitionByName(targetDoc, macroName);
-        if (macroDef?.node) {
-          const { startPosition, endPosition } = macroDef.node;
+        const targetFsPath = url.fileURLToPath(targetUri);
+        const macroRange = findJinjaMacroDefinitionRange(targetFsPath, macroName);
+        if (macroRange) {
           logToClient(`[Definition MacroCall] Found definition for '${macroName}'.`);
-          return [{ uri: targetUri, range: Range.create(startPosition.row, startPosition.column, endPosition.row, endPosition.column) }];
+          return [{ uri: targetUri, range: macroRange }];
         }
-        logToClient(`[Definition MacroCall] Macro '${macroName}' not found by findMacroDefinitionByName.`);
+        logToClient(`[Definition MacroCall] Macro '${macroName}' not found in ${targetFsPath}.`);
         return null; // If context was macro_call, we've handled it or failed to find it.
       }
     } // End context handling
@@ -422,18 +546,16 @@ connection.onDefinition(
 
       if (sourceFileForImportedWord) {
         logToClient(`[Definition FallbackImport] '${wordAtCursor}' is imported from '${sourceFileForImportedWord}'.`);
-        if (!TEMPLATES_ROOT) { logToClient('[Definition FallbackImport] TEMPLATES_ROOT not set.'); return null; }
+        if (!pathRoot) { logToClient('[Definition FallbackImport] No project root set.'); return null; }
         const pathModule = require('path');
-        const targetTemplateFsPath = pathModule.resolve(TEMPLATES_ROOT, sourceFileForImportedWord);
+        const targetTemplateFsPath = pathModule.resolve(pathRoot, sourceFileForImportedWord);
         try {
-          const fileText = fs.readFileSync(targetTemplateFsPath, 'utf8');
+          fs.accessSync(targetTemplateFsPath);
           const targetUri = url.pathToFileURL(targetTemplateFsPath).toString();
-          const targetDocForImport = TextDocument.create(targetUri, 'jinja', 1, fileText); // Use new var name
-          const macroDef = findMacroDefinitionByName(targetDocForImport, wordAtCursor);
-          if (macroDef?.node) {
-            const { startPosition, endPosition } = macroDef.node;
+          const macroRange = findJinjaMacroDefinitionRange(targetTemplateFsPath, wordAtCursor);
+          if (macroRange) {
             logToClient(`[Definition FallbackImportSuccess] Jumping to '${wordAtCursor}' in '${sourceFileForImportedWord}'`);
-            return [{ uri: targetUri, range: Range.create(startPosition.row, startPosition.column, endPosition.row, endPosition.column) }];
+            return [{ uri: targetUri, range: macroRange }];
           }
           logToClient(`[Definition FallbackImport] Macro '${wordAtCursor}' not found in '${sourceFileForImportedWord}'.`);
           // Do not return null here, allow fall through to SameFileFallback if this path fails
@@ -444,13 +566,25 @@ connection.onDefinition(
       
       // Path 4: If FallbackImport didn't return, try SameFileFallback (still within if(wordAtCursor) block)
       logToClient(`[Definition SameFileFallback] Checking if '${wordAtCursor}' is a macro in the current file: ${doc.uri}`);
-      const macroDef = findMacroDefinitionByName(doc, wordAtCursor);
-      if (macroDef?.node) {
-          const { startPosition, endPosition } = macroDef.node;
+      const sameFileRange = findJinjaMacroDefinitionRange(templatePath, wordAtCursor);
+      if (sameFileRange) {
           logToClient(`[Definition SameFileFallback] Found '${wordAtCursor}' in current file.`);
-          return [{ uri: doc.uri, range: Range.create(startPosition.row, startPosition.column, endPosition.row, endPosition.column) }];
+          return [{ uri: doc.uri, range: sameFileRange }];
       }
       logToClient(`[Definition SameFileFallback] '${wordAtCursor}' not found as a macro in the current file.`);
+
+      if (dbtRoot && wordAtCursor) {
+        const projectMacro = findMacroInDbtMacrosDir(dbtRoot, wordAtCursor);
+        if (projectMacro) {
+          logToClient(`[Definition dbt macros] Found '${wordAtCursor}' in ${projectMacro.filePath}`);
+          return [
+            {
+              uri: url.pathToFileURL(projectMacro.filePath).toString(),
+              range: projectMacro.range,
+            },
+          ];
+        }
+      }
     }
 
     logToClient(`[Definition] No definition found for '${wordAtCursor || 'cursor position'}'.`);
@@ -470,6 +604,8 @@ connection.onHover(
     if (!word) return null;
 
     const templatePath = url.fileURLToPath(doc.uri);
+    const dbtRootHover = templatePath.endsWith('.sql') ? findDbtProjectRoot(templatePath) : null;
+    const pathRootHover = dbtRootHover || TEMPLATES_ROOT;
     let result;
     let info: { type?: string; doc?: string } = {};
 
@@ -480,11 +616,11 @@ connection.onHover(
 
     // Priority 1: Hovering on an actual macro call site identified by getDefinitionContext
     if (defContext?.type === 'macro_call' && defContext.name === word && defContext.sourceTemplate) {
-      if (!TEMPLATES_ROOT) {
-        logToClient('[HoverImportedMacroCall] TEMPLATES_ROOT not set. Cannot resolve imported macro hover.');
+      if (!pathRootHover) {
+        logToClient('[HoverImportedMacroCall] No project root set. Cannot resolve imported macro hover.');
       } else {
         const path = require('path');
-        const absoluteSourcePath = path.resolve(TEMPLATES_ROOT, defContext.sourceTemplate);
+        const absoluteSourcePath = path.resolve(pathRootHover, defContext.sourceTemplate);
         logToClient(`[HoverImportedMacroCall] Looking for macro '${word}' in source '${absoluteSourcePath}'`);
         const args = ['-m', 'typedjinja.lsp_server', 'hover_macro', absoluteSourcePath, word];
         logToClient(`[HoverImportedMacroCall] Invoking: ${pythonExec} ${args.join(' ')}`);
@@ -521,11 +657,11 @@ connection.onHover(
       }
 
       if (sourceTemplateForWord && matchedImportedName) {
-        if (!TEMPLATES_ROOT) {
-          logToClient('[HoverImportedName] TEMPLATES_ROOT not set. Cannot resolve imported macro hover.');
+        if (!pathRootHover) {
+          logToClient('[HoverImportedName] No project root set. Cannot resolve imported macro hover.');
         } else {
           const path = require('path');
-          const absoluteSourcePath = path.resolve(TEMPLATES_ROOT, sourceTemplateForWord);
+          const absoluteSourcePath = path.resolve(pathRootHover, sourceTemplateForWord);
           logToClient(`[HoverImportedName] Word '${matchedImportedName}' is imported from '${absoluteSourcePath}'`);
           const args = ['-m', 'typedjinja.lsp_server', 'hover_macro', absoluteSourcePath, matchedImportedName];
           logToClient(`[HoverImportedName] Invoking: ${pythonExec} ${args.join(' ')}`);
@@ -589,8 +725,13 @@ connection.onHover(
 // Diagnostics handler
 async function runDiagnostics(doc: TextDocument) {
   if (!doc) return;
-  logToClient(`[Diagnostics] Triggered for: ${doc.uri}`);
   const templatePath = url.fileURLToPath(doc.uri);
+  if (templatePath.endsWith('.sql')) {
+    logToClient(`[Diagnostics] Skipping dbt SQL (no TypedJinja stub): ${doc.uri}`);
+    connection.sendDiagnostics({ uri: doc.uri, diagnostics: [] });
+    return;
+  }
+  logToClient(`[Diagnostics] Triggered for: ${doc.uri}`);
   logToClient(`[Diagnostics] Template path: ${templatePath}`);
   const stubPath = (() => {
     const path = require('path');
